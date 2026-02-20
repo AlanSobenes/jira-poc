@@ -30,15 +30,20 @@ def main() -> int:
     try:
         config = load_config()
         client = JiraClient(config)
-        changes, stats = build_changes(client, config)
+        changes, stats = build_changes(client, config, include_diagnostics=args.dry_run)
 
         apply_changes(client, config, changes, apply=args.apply, stats=stats)
+        pagination = client.pagination_summary()
 
         print("----- SUMMARY -----")
         print(f"Issues scanned: {stats.issues_scanned}")
         print(f"Dependencies found: {stats.dependencies_found}")
         print(f"Labels added: {stats.labels_added}")
         print(f"Labels removed: {stats.labels_removed}")
+        print(f"Search queries executed: {pagination['queries_executed']}")
+        print(f"Search pages fetched: {pagination['pages_fetched']}")
+        print(f"Search issues fetched: {pagination['issues_fetched']}")
+        print(f"Pagination mismatches: {pagination['reported_total_mismatches']}")
         print(f"Mode: {'APPLY' if args.apply else 'DRY-RUN'}")
         return 0
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Set, Tuple
@@ -21,8 +21,13 @@ class RunStats:
 @dataclass
 class PlannedChange:
     issue_key: str
-    add_label: bool = False
-    remove_label: bool = False
+    labels_to_add: Set[str] = field(default_factory=set)
+    labels_to_remove: Set[str] = field(default_factory=set)
+    reasons: List[str] = field(default_factory=list)
+
+
+def _normalized_set(values: Iterable[str]) -> Set[str]:
+    return {value.casefold() for value in values}
 
 
 def _is_authoritative_link(link: dict, config: AppConfig) -> bool:
@@ -59,21 +64,54 @@ def _allowed_by_scope(issue: dict, config: AppConfig) -> bool:
     return issue_type in config.core_issue_types and status not in set(config.ignored_statuses)
 
 
+def _has_label(existing_labels: Iterable[str], label: str) -> bool:
+    target = label.casefold()
+    return any(existing.casefold() == target for existing in existing_labels)
+
+
+def _matching_labels(existing_labels: Iterable[str], target_labels: Iterable[str]) -> Set[str]:
+    targets = _normalized_set(target_labels)
+    if not targets:
+        return set()
+    return {label for label in existing_labels if label.casefold() in targets}
+
+
+def _upsert_change(
+    changes_by_key: Dict[str, PlannedChange],
+    issue_key: str,
+    labels_to_add: Set[str],
+    labels_to_remove: Set[str],
+    reason: str,
+) -> None:
+    if not labels_to_add and not labels_to_remove:
+        return
+
+    change = changes_by_key.setdefault(issue_key, PlannedChange(issue_key=issue_key))
+    change.labels_to_add.update(labels_to_add)
+    change.labels_to_remove.update(labels_to_remove)
+
+    if reason and reason not in change.reasons:
+        change.reasons.append(reason)
+
+
 def load_core_scope(client: JiraClient, config: AppConfig) -> List[dict]:
     core_jql = client.build_core_jql()
     fields = ["issuetype", "status", "issuelinks", "labels"]
-    result = client.search_issues(core_jql, fields=fields)
+    result = client.search_issues(core_jql, fields=fields, query_name="core-scope")
     return [issue for issue in result.issues if _allowed_by_scope(issue, config)]
 
 
-def build_changes(client: JiraClient, config: AppConfig) -> Tuple[List[PlannedChange], RunStats]:
+def build_changes(client: JiraClient, config: AppConfig, include_diagnostics: bool = False) -> Tuple[List[PlannedChange], RunStats]:
     stats = RunStats()
-    changes: List[PlannedChange] = []
+    changes_by_key: Dict[str, PlannedChange] = {}
+    ignored_statuses = _normalized_set(config.ignored_statuses)
+    alias_labels = list(config.dependency_label_aliases)
+    tracked_labels = [config.dependency_label, *alias_labels]
 
     core_issues = load_core_scope(client, config)
     core_keys = {issue["key"] for issue in core_issues}
-
     stats.issues_scanned = len(core_issues)
+    inspected_dependency_issues: Set[str] = set()
 
     for core_issue in core_issues:
         linked_keys = _linked_issue_keys(core_issue, client, config)
@@ -83,17 +121,41 @@ def build_changes(client: JiraClient, config: AppConfig) -> Tuple[List[PlannedCh
 
             stats.dependencies_found += 1
 
-            linked_issue = client.get_issue(linked_key, fields=["labels", "status"])
-            linked_status = JiraClient.get_status_name(linked_issue)
-            if linked_status in set(config.ignored_statuses):
+            if linked_key in inspected_dependency_issues:
+                continue
+            inspected_dependency_issues.add(linked_key)
+
+            linked_issue = client.get_issue(linked_key, fields=["labels", "status", "issuelinks"])
+            linked_status = JiraClient.get_status_name(linked_issue).casefold()
+            if linked_status in ignored_statuses:
                 continue
 
-            labels = set(JiraClient.get_labels(linked_issue))
-            if config.dependency_label not in labels:
-                changes.append(PlannedChange(issue_key=linked_key, add_label=True))
+            labels = JiraClient.get_labels(linked_issue)
+            canonical_missing = not _has_label(labels, config.dependency_label)
+            aliases_present = _matching_labels(labels, alias_labels)
+            labels_to_add = {config.dependency_label} if canonical_missing else set()
+            labels_to_remove = set(aliases_present)
 
-    label_jql = client.labeled_issues_jql(config.dependency_label)
-    labeled = client.search_issues(label_jql, fields=["issuelinks", "labels", "status"]).issues
+            reason_parts: List[str] = ["Still depends on CORE"]
+            if canonical_missing:
+                reason_parts.append("canonical label missing")
+            if aliases_present:
+                reason_parts.append(f"alias labels present: {sorted(aliases_present)}")
+
+            _upsert_change(
+                changes_by_key,
+                issue_key=linked_key,
+                labels_to_add=labels_to_add,
+                labels_to_remove=labels_to_remove,
+                reason="; ".join(reason_parts),
+            )
+
+    label_jql = client.labeled_issues_jql(tracked_labels)
+    labeled = client.search_issues(
+        label_jql,
+        fields=["issuelinks", "labels", "status"],
+        query_name="cleanup-scan",
+    ).issues
 
     for issue in labeled:
         issue_key = issue["key"]
@@ -101,26 +163,72 @@ def build_changes(client: JiraClient, config: AppConfig) -> Tuple[List[PlannedCh
         if issue_key in core_keys:
             continue
 
-        status = JiraClient.get_status_name(issue)
-        if status in set(config.ignored_statuses):
+        status = JiraClient.get_status_name(issue).casefold()
+        if status in ignored_statuses:
             continue
 
-        still_depends_on_core = bool(_linked_issue_keys(issue, client, config) & core_keys)
-        if not still_depends_on_core:
-            labels = set(JiraClient.get_labels(issue))
-            if config.dependency_label in labels:
-                changes.append(PlannedChange(issue_key=issue_key, remove_label=True))
+        labels = JiraClient.get_labels(issue)
+        canonical_present = _matching_labels(labels, [config.dependency_label])
+        aliases_present = _matching_labels(labels, alias_labels)
+        tracked_present = canonical_present | aliases_present
 
-    deduped: Dict[str, PlannedChange] = {}
-    for change in changes:
-        existing = deduped.get(change.issue_key)
-        if not existing:
-            deduped[change.issue_key] = change
+        if not tracked_present:
             continue
-        existing.add_label = existing.add_label or change.add_label
-        existing.remove_label = existing.remove_label or change.remove_label
 
-    final_changes = [c for c in deduped.values() if c.add_label != c.remove_label]
+        linked_keys = _linked_issue_keys(issue, client, config)
+        core_intersection = linked_keys & core_keys
+        still_depends_on_core = bool(core_intersection)
+
+        if still_depends_on_core:
+            labels_to_add = {config.dependency_label} if not canonical_present else set()
+            labels_to_remove = set(aliases_present)
+
+            reason_parts = [f"Still depends on CORE via: {sorted(core_intersection)}"]
+            if labels_to_add:
+                reason_parts.append("add canonical label")
+            if labels_to_remove:
+                reason_parts.append(f"remove aliases: {sorted(labels_to_remove)}")
+
+            _upsert_change(
+                changes_by_key,
+                issue_key=issue_key,
+                labels_to_add=labels_to_add,
+                labels_to_remove=labels_to_remove,
+                reason="; ".join(reason_parts),
+            )
+            continue
+
+        labels_to_remove = set(tracked_present)
+        reason = "No authoritative links to CORE remain"
+
+        if include_diagnostics and labels_to_remove:
+            print(
+                f"REMOVE-DIAGNOSTIC: issue={issue_key} "
+                f"linked_keys={sorted(linked_keys)} "
+                f"core_intersection={sorted(core_intersection)} "
+                f"current_labels={sorted(labels)} "
+                f"reason={reason}"
+            )
+
+        _upsert_change(
+            changes_by_key,
+            issue_key=issue_key,
+            labels_to_add=set(),
+            labels_to_remove=labels_to_remove,
+            reason=reason,
+        )
+
+    final_changes: List[PlannedChange] = []
+    for change in changes_by_key.values():
+        remove_normalized = {label.casefold() for label in change.labels_to_remove}
+        if remove_normalized:
+            change.labels_to_add = {
+                label for label in change.labels_to_add if label.casefold() not in remove_normalized
+            }
+
+        if change.labels_to_add or change.labels_to_remove:
+            final_changes.append(change)
+
     return final_changes, stats
 
 
@@ -141,6 +249,7 @@ def _write_audit_file(config: AppConfig, stats: RunStats, applied_changes: List[
         "core_filter_id": config.jira_core_filter_id,
         "core_jql": config.jira_core_jql,
         "dependency_label": config.dependency_label,
+        "dependency_label_aliases": config.dependency_label_aliases,
         "summary": {
             "issues_scanned": stats.issues_scanned,
             "dependencies_found": stats.dependencies_found,
@@ -158,14 +267,17 @@ def apply_changes(client: JiraClient, config: AppConfig, changes: Iterable[Plann
     applied_changes: List[Dict[str, object]] = []
 
     for change in sorted(changes, key=lambda c: c.issue_key):
-        labels_to_add = {config.dependency_label} if change.add_label else set()
-        labels_to_remove = {config.dependency_label} if change.remove_label else set()
+        labels_to_add = set(change.labels_to_add)
+        labels_to_remove = set(change.labels_to_remove)
 
-        action_parts = []
-        if change.add_label:
-            action_parts.append(f"add {config.dependency_label}")
-        if change.remove_label:
-            action_parts.append(f"remove {config.dependency_label}")
+        if not labels_to_add and not labels_to_remove:
+            continue
+
+        action_parts: List[str] = []
+        if labels_to_add:
+            action_parts.append(f"add {sorted(labels_to_add)}")
+        if labels_to_remove:
+            action_parts.append(f"remove {sorted(labels_to_remove)}")
         action_text = " and ".join(action_parts)
 
         if apply:
@@ -173,18 +285,19 @@ def apply_changes(client: JiraClient, config: AppConfig, changes: Iterable[Plann
             print(f"APPLY: {change.issue_key}: {action_text}")
         else:
             print(f"DRY-RUN: {change.issue_key}: {action_text}")
+            for reason in change.reasons:
+                print(f"  reason: {reason}")
 
-        if change.add_label:
-            stats.labels_added += 1
-        if change.remove_label:
-            stats.labels_removed += 1
+        stats.labels_added += len(labels_to_add)
+        stats.labels_removed += len(labels_to_remove)
 
         applied_changes.append(
             {
                 "issue_key": change.issue_key,
-                "add_label": change.add_label,
-                "remove_label": change.remove_label,
+                "labels_to_add": sorted(labels_to_add),
+                "labels_to_remove": sorted(labels_to_remove),
                 "action": action_text,
+                "reasons": change.reasons,
             }
         )
 

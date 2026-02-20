@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Set
 
 CANONICAL_LABEL = "DFS_CORE_Dependencies"
 DEFAULT_BASE_URL = "https://jira-sandbox.atlassian.net"  # YOUR JIRA ENDPOINT
@@ -51,6 +51,7 @@ class AppConfig:
     jira_auth_mode: str
     jira_email_env_var: str
     dependency_label: str
+    dependency_label_aliases: List[str]
     core_issue_types: List[str]
     authoritative_link_types: List[str]
     ignored_statuses: List[str]
@@ -62,8 +63,15 @@ def load_config() -> AppConfig:
     _load_dotenv()
 
     jira_base_url = os.getenv("JIRA_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
-    jira_core_filter_id = os.getenv("JIRA_CORE_FILTER_ID", DEFAULT_CORE_FILTER_ID).strip() or None
     jira_core_jql = os.getenv("JIRA_CORE_JQL", "").strip() or None
+    jira_core_filter_raw = os.getenv("JIRA_CORE_FILTER_ID")
+
+    # If explicit JQL is provided, do not auto-inject a default filter id.
+    if jira_core_jql:
+        jira_core_filter_id = (jira_core_filter_raw or "").strip() or None
+    else:
+        fallback_filter = jira_core_filter_raw if jira_core_filter_raw is not None else DEFAULT_CORE_FILTER_ID
+        jira_core_filter_id = (fallback_filter or "").strip() or None
 
     if not jira_core_filter_id and not jira_core_jql:
         raise ConfigError("Set JIRA_CORE_FILTER_ID or JIRA_CORE_JQL.")
@@ -84,6 +92,19 @@ def load_config() -> AppConfig:
     if jira_auth_mode not in VALID_AUTH_MODES:
         raise ConfigError("JIRA_AUTH_MODE must be one of: auto, basic, bearer.")
 
+    dependency_label = os.getenv("JIRA_DEPENDENCY_LABEL", CANONICAL_LABEL).strip() or CANONICAL_LABEL
+    dependency_label_aliases_raw = _csv_env("JIRA_DEPENDENCY_LABEL_ALIASES", [])
+    dependency_label_aliases: List[str] = []
+    seen_aliases: Set[str] = set()
+    canonical_normalized = dependency_label.casefold()
+
+    for alias in dependency_label_aliases_raw:
+        normalized = alias.casefold()
+        if normalized == canonical_normalized or normalized in seen_aliases:
+            continue
+        seen_aliases.add(normalized)
+        dependency_label_aliases.append(alias)
+
     return AppConfig(
         jira_base_url=jira_base_url,
         jira_core_filter_id=jira_core_filter_id,
@@ -91,7 +112,8 @@ def load_config() -> AppConfig:
         jira_token_env_var=os.getenv("JIRA_TOKEN_ENV_VAR", "JIRA_PAT"),
         jira_auth_mode=jira_auth_mode,
         jira_email_env_var=os.getenv("JIRA_EMAIL_ENV_VAR", "JIRA_EMAIL"),
-        dependency_label=os.getenv("JIRA_DEPENDENCY_LABEL", CANONICAL_LABEL),
+        dependency_label=dependency_label,
+        dependency_label_aliases=dependency_label_aliases,
         core_issue_types=_csv_env("JIRA_CORE_ISSUE_TYPES", DEFAULT_ISSUE_TYPES),
         authoritative_link_types=[s.lower() for s in _csv_env("JIRA_LINK_TYPES", DEFAULT_LINK_TYPES)],
         ignored_statuses=_csv_env("JIRA_IGNORED_STATUSES", DEFAULT_IGNORED_STATUSES),
