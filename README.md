@@ -4,7 +4,7 @@
 Batch script that synchronizes one canonical label on external dependency issues:
 - Canonical label: `DFS_CORE_Dependencies`
 - CORE source of truth: saved filter ID `1244128` (or optional custom JQL)
-- Dependency links inspected: `blocks`, `is blocked by`, `depends on`
+- Dependency links inspected: `blocks`, `is blocked by`, `depends on`,`is a dependency of`
 - Ignored status: `Canceled`
 
 Behavior:
