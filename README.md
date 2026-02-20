@@ -57,32 +57,58 @@ python3 -m pip install -r requirements.txt
 ```
 
 ## Configure
-Defaults already match your final inputs:
-- `JIRA_BASE_URL=https://jira.kdc.capitalone.com`
-- `JIRA_CORE_FILTER_ID=1244128`
-- `JIRA_CORE_ISSUE_TYPES=Initiative,Epic,Story`
-- `JIRA_LINK_TYPES=blocks,is blocked by,depends on`
-- `JIRA_IGNORED_STATUSES=Canceled`
-- `JIRA_DEPENDENCY_LABEL=DFS_CORE_Dependencies`
-
 Set token via env / `.env` / `.netrc` (see `auth/README.md`).
 
-Optional `.env` example:
+### Required `.env` variables
 ```dotenv
+# Jira endpoint
+JIRA_BASE_URL=https://jira.kdc.capitalone.com
+
+# Auth token
 JIRA_PAT=replace_me
 # For Jira Cloud (.atlassian.net), also set:
 # JIRA_EMAIL=you@company.com
 
-# Optional overrides:
-# JIRA_BASE_URL=https://jira.kdc.capitalone.com
-# JIRA_AUTH_MODE=auto
-# JIRA_CORE_FILTER_ID=1244128
-# JIRA_CORE_JQL=
-# JIRA_CORE_ISSUE_TYPES=Initiative,Epic,Story
-# JIRA_LINK_TYPES=blocks,is blocked by,depends on
-# JIRA_IGNORED_STATUSES=Canceled
-# JIRA_DEPENDENCY_LABEL=DFS_CORE_Dependencies
+# Scope selector: set exactly one of the next two
+JIRA_CORE_FILTER_ID=1244128
+# JIRA_CORE_JQL=project = COREPM AND issuetype in (Initiative, Epic, Story)
+
+# Canonical dependency label
+JIRA_DEPENDENCY_LABEL=DFS_CORE_Dependencies
 ```
+
+### Optional `.env` variables (recommended)
+```dotenv
+# Label typo/legacy cleanup
+JIRA_DEPENDENCY_LABEL_ALIASES=DFS_CORE_Dependecies,DFS_CORE_Dependency,DFS_CORE_dependency
+
+# CORE scope filters
+JIRA_CORE_ISSUE_TYPES=Initiative,Epic,Story
+JIRA_IGNORED_STATUSES=Canceled
+
+# Preferred dependency-link matching mode: strict by Jira link type IDs
+# (if set, IDs are used instead of JIRA_LINK_TYPES names)
+JIRA_LINK_TYPE_IDS=
+JIRA_LINK_DIRECTIONS=inward,outward
+
+# Always ignore clone link relationships
+JIRA_IGNORED_LINK_NAMES=clones,is cloned by
+JIRA_IGNORED_LINK_TYPE_IDS=
+
+# Name-based fallback only when JIRA_LINK_TYPE_IDS is empty
+JIRA_LINK_TYPES=blocks,is blocked by,depends on,is dependent on,is a dependency of
+
+# Runtime tuning
+JIRA_AUTH_MODE=auto
+JIRA_PAGE_SIZE=100
+JIRA_REQUEST_TIMEOUT_SECONDS=30
+```
+
+### Rules and precedence
+- Set only one of `JIRA_CORE_FILTER_ID` or `JIRA_CORE_JQL`.
+- If `JIRA_LINK_TYPE_IDS` is set, dependency matching uses link `type.id` + `JIRA_LINK_DIRECTIONS`.
+- If `JIRA_LINK_TYPE_IDS` is empty, dependency matching falls back to `JIRA_LINK_TYPES`.
+- Clone links (`clones`, `is cloned by`) are excluded from dependency logic and cleanup checks.
 
 ## Run
 Required flag policy:

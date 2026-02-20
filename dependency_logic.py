@@ -30,28 +30,51 @@ def _normalized_set(values: Iterable[str]) -> Set[str]:
     return {value.casefold() for value in values}
 
 
-def _is_authoritative_link(link: dict, config: AppConfig) -> bool:
-    link_type = (link.get("type", {}) or {}).get("name", "").strip().lower()
-    inward = (link.get("type", {}) or {}).get("inward", "").strip().lower()
-    outward = (link.get("type", {}) or {}).get("outward", "").strip().lower()
+def _link_type_parts(link: dict) -> Tuple[str, str, str, str]:
+    link_type = link.get("type", {}) or {}
+    link_type_id = str(link_type.get("id", "")).strip()
+    link_name = link_type.get("name", "").strip().casefold()
+    inward = link_type.get("inward", "").strip().casefold()
+    outward = link_type.get("outward", "").strip().casefold()
+    return link_type_id, link_name, inward, outward
 
-    allowed = set(config.authoritative_link_types)
-    return link_type in allowed or inward in allowed or outward in allowed
+
+def _is_ignored_link(link: dict, config: AppConfig) -> bool:
+    link_type_id, link_name, inward, outward = _link_type_parts(link)
+    ignored_type_ids = set(config.ignored_link_type_ids)
+    if link_type_id and link_type_id in ignored_type_ids:
+        return True
+
+    ignored_names = _normalized_set(config.ignored_link_names)
+    return link_name in ignored_names or inward in ignored_names or outward in ignored_names
+
+
+def _is_authoritative_link_direction(link: dict, direction: str, config: AppConfig) -> bool:
+    if direction not in _normalized_set(config.authoritative_link_directions):
+        return False
+    if _is_ignored_link(link, config):
+        return False
+
+    link_type_id, link_name, inward, outward = _link_type_parts(link)
+    authoritative_type_ids = set(config.authoritative_link_type_ids)
+    if authoritative_type_ids:
+        return bool(link_type_id) and link_type_id in authoritative_type_ids
+
+    allowed_names = _normalized_set(config.authoritative_link_types)
+    direction_name = outward if direction == "outward" else inward
+    return link_name in allowed_names or direction_name in allowed_names
 
 
 def _linked_issue_keys(issue: dict, client: JiraClient, config: AppConfig) -> Set[str]:
     keys: Set[str] = set()
 
     for link in client.get_issue_links(issue):
-        if not _is_authoritative_link(link, config):
-            continue
-
         outward_key = client.extract_issue_key(link.get("outwardIssue"))
         inward_key = client.extract_issue_key(link.get("inwardIssue"))
 
-        if outward_key:
+        if outward_key and _is_authoritative_link_direction(link, "outward", config):
             keys.add(outward_key)
-        if inward_key:
+        if inward_key and _is_authoritative_link_direction(link, "inward", config):
             keys.add(inward_key)
 
     return keys
@@ -199,7 +222,7 @@ def build_changes(client: JiraClient, config: AppConfig, include_diagnostics: bo
             continue
 
         labels_to_remove = set(tracked_present)
-        reason = "No authoritative links to CORE remain"
+        reason = "No authoritative dependency links to CORE remain (clone/non-authoritative link types ignored)"
 
         if include_diagnostics and labels_to_remove:
             print(

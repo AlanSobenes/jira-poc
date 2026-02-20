@@ -8,7 +8,9 @@ CANONICAL_LABEL = "DFS_CORE_Dependencies"
 DEFAULT_BASE_URL = "https://jira-sandbox.atlassian.net"  # YOUR JIRA ENDPOINT
 DEFAULT_CORE_FILTER_ID = "1244128"
 DEFAULT_ISSUE_TYPES = ["Initiative", "Epic", "Story"]
-DEFAULT_LINK_TYPES = ["blocks", "is blocked by", "depends on"]
+DEFAULT_LINK_TYPES = ["blocks", "is blocked by", "depends on", "is dependent on", "is a dependency of"]
+DEFAULT_LINK_DIRECTIONS = ["inward", "outward"]
+DEFAULT_IGNORED_LINK_NAMES = ["clones", "is cloned by"]
 DEFAULT_IGNORED_STATUSES = ["Canceled"]
 VALID_AUTH_MODES = {"auto", "basic", "bearer"}
 
@@ -42,6 +44,29 @@ def _csv_env(name: str, default: List[str]) -> List[str]:
     return [part.strip() for part in raw.split(",") if part.strip()]
 
 
+def _dedupe_preserve(values: List[str]) -> List[str]:
+    deduped: List[str] = []
+    seen: Set[str] = set()
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        deduped.append(value)
+    return deduped
+
+
+def _dedupe_casefold(values: List[str]) -> List[str]:
+    deduped: List[str] = []
+    seen: Set[str] = set()
+    for value in values:
+        key = value.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(value)
+    return deduped
+
+
 @dataclass(frozen=True)
 class AppConfig:
     jira_base_url: str
@@ -54,6 +79,10 @@ class AppConfig:
     dependency_label_aliases: List[str]
     core_issue_types: List[str]
     authoritative_link_types: List[str]
+    authoritative_link_type_ids: List[str]
+    authoritative_link_directions: List[str]
+    ignored_link_type_ids: List[str]
+    ignored_link_names: List[str]
     ignored_statuses: List[str]
     page_size: int
     request_timeout_seconds: int
@@ -105,6 +134,31 @@ def load_config() -> AppConfig:
         seen_aliases.add(normalized)
         dependency_label_aliases.append(alias)
 
+    authoritative_link_types = _dedupe_casefold(
+        [s.lower() for s in _csv_env("JIRA_LINK_TYPES", DEFAULT_LINK_TYPES)]
+    )
+    authoritative_link_type_ids = _dedupe_preserve(
+        [s.strip() for s in _csv_env("JIRA_LINK_TYPE_IDS", []) if s.strip()]
+    )
+    authoritative_link_directions = _dedupe_casefold(
+        [s.lower() for s in _csv_env("JIRA_LINK_DIRECTIONS", DEFAULT_LINK_DIRECTIONS)]
+    )
+    invalid_directions = [d for d in authoritative_link_directions if d not in {"inward", "outward"}]
+    if invalid_directions:
+        raise ConfigError(
+            "JIRA_LINK_DIRECTIONS contains invalid values. Allowed values: inward, outward. "
+            f"Received: {invalid_directions}"
+        )
+    if not authoritative_link_directions:
+        raise ConfigError("JIRA_LINK_DIRECTIONS must include at least one of: inward, outward.")
+
+    ignored_link_type_ids = _dedupe_preserve(
+        [s.strip() for s in _csv_env("JIRA_IGNORED_LINK_TYPE_IDS", []) if s.strip()]
+    )
+    ignored_link_names = _dedupe_casefold(
+        [s.lower() for s in _csv_env("JIRA_IGNORED_LINK_NAMES", DEFAULT_IGNORED_LINK_NAMES)]
+    )
+
     return AppConfig(
         jira_base_url=jira_base_url,
         jira_core_filter_id=jira_core_filter_id,
@@ -115,7 +169,11 @@ def load_config() -> AppConfig:
         dependency_label=dependency_label,
         dependency_label_aliases=dependency_label_aliases,
         core_issue_types=_csv_env("JIRA_CORE_ISSUE_TYPES", DEFAULT_ISSUE_TYPES),
-        authoritative_link_types=[s.lower() for s in _csv_env("JIRA_LINK_TYPES", DEFAULT_LINK_TYPES)],
+        authoritative_link_types=authoritative_link_types,
+        authoritative_link_type_ids=authoritative_link_type_ids,
+        authoritative_link_directions=authoritative_link_directions,
+        ignored_link_type_ids=ignored_link_type_ids,
+        ignored_link_names=ignored_link_names,
         ignored_statuses=_csv_env("JIRA_IGNORED_STATUSES", DEFAULT_IGNORED_STATUSES),
         page_size=page_size,
         request_timeout_seconds=timeout_seconds,
